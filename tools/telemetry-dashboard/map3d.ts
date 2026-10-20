@@ -8,11 +8,19 @@
  *    screen ((gx-gy)*25, (gx+gy)*12.5). That ratio is `sin(elevation) = 0.5`, so
  *    the camera sits at 30° and an orthographic frustum — a perspective cone
  *    cannot hold parallel edges and the diamond goes crooked at the far corner.
- *  - **Real terrain relief.** The plate is the map's own elevation grid,
- *    displaced per cell and lit by one fixed sun, so hills read as hills instead
- *    of a flat diamond. The grid, its every-fourth emphasis and its boundary are
- *    baked once into a canvas texture applied to that displaced surface, so the
- *    glowing cell lines follow the terrain.
+ *  - **Terraced relief, RA2's own height quantum.** The plate is the map's own
+ *    elevation grid, but stacked the way the game stacks it: one discrete level
+ *    per cell, 15 px of rise against a 30 px tile (`HEIGHT_STEP` / `TILE_HEIGHT`
+ *    in `src/map/terrain.rs`), so every cell keeps a flat top of its own and a
+ *    boundary whose two cells differ drops a step face between them. A raised
+ *    area therefore reads as a plateau with cliff edges instead of a smooth 3D
+ *    hill. The grid, its every-fourth emphasis and its boundary are baked once
+ *    into a canvas texture applied to those flat tops, so the glowing cell lines
+ *    follow the terraces. Three land features ride the same grid: a ramp cell
+ *    (`slope_type != 0`) tilts its own top toward its lower neighbours instead
+ *    of dropping a step face; a water cell (`LandType::Water`) takes a solid
+ *    blue top with no grid; and a structural bridge cell lifts a steel deck
+ *    `deck_rises` levels above its ground, with side faces down to it.
  *  - **Unlit, per-category solids.** Entities are flat three-tone solids, not
  *    shaded geometry, so their boxes carry baked per-face vertex colours and an
  *    unlit material. Each category gets its own silhouette (post, hull+turret,
@@ -35,14 +43,29 @@
 
 import * as THREE from "./vendor/three.module.js";
 import { t } from "./i18n.js";
-import { DebugPanel, EntityCategory, EntitySpot, HousePopulation, TerrainGrid, TelemetrySnapshot } from "./types.js";
+import { DebugPanel, EntityCategory, EntitySpot, HousePopulation, TelemetrySnapshot } from "./types.js";
 
 /** InstancedMesh capacity per category: the project's 20k-unit target, so a
  *  single-category world can still field the whole capped spot list. */
 const MAX_SPOTS = 20000;
 /** One elevation level's visual offset, in world units. Shared by the terrain
- *  surface and the entity boxes, so a unit stands exactly on its cell. */
+ *  surface and the entity boxes, so a unit stands exactly on its cell. RA2's
+ *  own quantum: a level raises a cell by 15 px against a 30 px tile, which is
+ *  this half cell — a discrete step, not a height field to interpolate. */
 const LEVEL_STEP = 0.5;
+/** Step faces between terraces are rock in RA2, not floor: a dark tone the same
+ *  sun shades, so a cliff reads as a wall instead of glowing grid. */
+const CLIFF_TONE = 0x141c2e;
+/** Water is a land type, not a height: `LandType::Water` (`2`) in
+ *  `src/rules/terrain_rules.rs`. A water cell keeps its flat top but takes a
+ *  blue tone with no grid, so a coastline reads at a glance. */
+const WATER_LAND_TYPE = 2;
+const WATER_TONE = 0x1d5f8c;
+/** A structural bridge deck is lifted `deck_rises` levels above its ground and
+ *  drawn in steel, so a high bridge reads as a raised span over its own
+ *  ground instead of flat terrain. Low, ground-level bridges have no rise and
+ *  no steel top. */
+const DECK_TONE = 0x4b5560;
 /** Per-category box scale (world units, one cell = 1). Height is not here: the
  *  geometry's own base offset sets where the solid meets the ground. */
 const CATEGORY_SCALE: Record<EntityCategory, number> = {
@@ -218,38 +241,81 @@ export function createMap3D(
   let extent = { w: 64, h: 64 };
   let aspect = 1;
 
-  // Terrain: the decoded elevation grid and the lit surface built from it. The
-  // grid arrives once per map, so it is cached and the surface is rebuilt only
-  // when it changes.
-  let terrain: { width: number; height: number; levels: Uint8Array } | null = null;
+  // Terrain: the decoded per-cell grids and the lit surface built from them.
+  // The grids arrive once per map, so they are cached and the surface is
+  // rebuilt only when they change.
+  interface DecodedTerrain {
+    width: number;
+    height: number;
+    /** Ground elevation level per cell. */
+    levels: Uint8Array;
+    /** `LandType` index per cell (`2` = Water). */
+    land: Uint8Array;
+    /** TMP slope type per cell (`0` = flat, `1..=16` = ramp). */
+    slope: Uint8Array;
+    /** Bridge deck rise in levels per cell (`0` = no raised deck). */
+    deck: Uint8Array;
+  }
+  let terrain: DecodedTerrain | null = null;
   let minLevel = 0;
 
-  // Lights only affect the terrain's Lambert material; the entity boxes stay
-  // unlit so their baked tones are exact.
+  // Lights only affect the terrain's Lambert materials — the flat tops and the
+  // step faces between them; the entity boxes stay unlit so their baked tones
+  // are exact.
   scene.add(new THREE.AmbientLight(0xffffff, 0.95));
   const sun = new THREE.DirectionalLight(0xffffff, 1.35);
   sun.position.set(0.5, 1.0, 0.35);
   scene.add(sun);
 
-  /** Elevation level at a cell, 0 when no terrain has arrived. */
-  function levelAt(rx: number, ry: number): number {
-    if (!terrain) return 0;
+  /** One decoded grid's value at a cell, clamped to the map and 0 off it. */
+  function sample(grid: Uint8Array | undefined, rx: number, ry: number): number {
+    if (!terrain || !grid) return 0;
     const cx = clampInt(rx, 0, terrain.width - 1);
     const cy = clampInt(ry, 0, terrain.height - 1);
-    return terrain.levels[cy * terrain.width + cx];
+    return grid[cy * terrain.width + cx];
   }
 
-  /** Decode the wire hex into one level byte per cell. */
-  function decodeTerrain(grid: TerrainGrid): Uint8Array {
-    const levels = new Uint8Array(grid.width * grid.height);
-    for (let i = 0; i < levels.length; i++) {
-      levels[i] = parseInt(grid.levels.slice(i * 2, i * 2 + 2), 16) || 0;
+  /** Ground elevation level at a cell, 0 when no terrain has arrived. */
+  function levelAt(rx: number, ry: number): number {
+    return sample(terrain?.levels, rx, ry);
+  }
+
+  /** `LandType` index at a cell. */
+  function landAt(rx: number, ry: number): number {
+    return sample(terrain?.land, rx, ry);
+  }
+
+  /** TMP slope type at a cell (`0` = flat). */
+  function slopeAt(rx: number, ry: number): number {
+    return sample(terrain?.slope, rx, ry);
+  }
+
+  /** Bridge deck rise in levels at a cell (`0` = no raised deck). */
+  function deckAt(rx: number, ry: number): number {
+    return sample(terrain?.deck, rx, ry);
+  }
+
+  /** World height a cell's top sits at: ground plus any bridge deck rise. Every
+   *  mark that has to sit on the terrain — entities, cursor, glows, paths,
+   *  callouts — reads this instead of the bare ground level. */
+  function surfaceAt(rx: number, ry: number): number {
+    return (levelAt(rx, ry) + deckAt(rx, ry)) * LEVEL_STEP;
+  }
+
+  /** Decode one wire hex grid into a byte per cell. */
+  function decodeHex(hex: string, count: number): Uint8Array {
+    const out = new Uint8Array(count);
+    for (let i = 0; i < count; i++) {
+      out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16) || 0;
     }
-    return levels;
+    return out;
   }
 
-  // --- ground: the displaced elevation surface, carrying the glowing grid ---
-  let plate: THREE.Mesh<THREE.PlaneGeometry, THREE.MeshLambertMaterial> | null = null;
+  // --- ground: the terraced elevation surface, carrying the glowing grid ----
+  let plate: THREE.Mesh | null = null;
+  /** The plate's four materials, in geometry group order: floor (glowing
+   *  grid), rock (step faces and bridge piers), water, bridge deck. */
+  let plateMaterials: THREE.MeshLambertMaterial[] = [];
 
   /** The map's grid, boundary and every-fourth emphasis, baked with a glow.
    *  WebGL lines are a fixed one pixel and cannot bloom, which is what makes the
@@ -296,12 +362,215 @@ export function createMap3D(
     return new THREE.CanvasTexture(sprite);
   }
 
+  /** The terraced plate. Ground tops are flat quads, merged along a row where
+   *  level and land type agree; a ramp cell's top is one tilted quad instead,
+   *  its corners dropping toward whichever neighbours are lower. A step face
+   *  fills every boundary whose two ground levels differ, unless the higher
+   *  cell is a ramp — its slope already reaches down. A water cell's top takes
+   *  its own material, and a high bridge cell adds a lifted deck quad plus the
+   *  side faces carrying it down to its neighbours. Emitted non-indexed, so
+   *  each face keeps its own normal and the corners stay hard, in four
+   *  contiguous material groups: floor (grid), rock, water, deck. */
+  function buildPlateGeometry(w: number, h: number): THREE.BufferGeometry {
+    interface Surface {
+      pos: number[];
+      uv: number[];
+    }
+    const floor: Surface = { pos: [], uv: [] };
+    const rock: Surface = { pos: [], uv: [] };
+    const water: Surface = { pos: [], uv: [] };
+    const deck: Surface = { pos: [], uv: [] };
+
+    const push = (dst: Surface, x: number, y: number, z: number, u: number, v: number): void => {
+      dst.pos.push(x, y, z);
+      dst.uv.push(u, v);
+    };
+    /** One quad, counter-clockwise seen from above, carrying the cell box's
+     *  texture corners. `a` is the cell's min-x/min-z corner. */
+    const quad = (
+      dst: Surface,
+      ax: number, ay: number, az: number,
+      bx: number, by: number, bz: number,
+      cx: number, cy: number, cz: number,
+      dx: number, dy: number, dz: number,
+      u0: number, v0: number, u1: number, v1: number,
+    ): void => {
+      push(dst, ax, ay, az, u0, v1);
+      push(dst, bx, by, bz, u0, v0);
+      push(dst, cx, cy, cz, u1, v0);
+      push(dst, ax, ay, az, u0, v1);
+      push(dst, cx, cy, cz, u1, v0);
+      push(dst, dx, dy, dz, u1, v1);
+    };
+
+    const isRamp = (rx: number, ry: number): boolean => slopeAt(rx, ry) !== 0;
+    const isDeck = (rx: number, ry: number): boolean => deckAt(rx, ry) > 0;
+    const isWater = (rx: number, ry: number): boolean => landAt(rx, ry) === WATER_LAND_TYPE;
+    /** A cell whose ground top is a plain quad: everything but a ramp's sloped
+     *  tile. A bridge cell still has ground under it, so it counts as flat. */
+    const flatGround = (rx: number, ry: number): boolean => isDeck(rx, ry) || !isRamp(rx, ry);
+
+    // The lowest terrace, for the ground bloom that hangs under the plate.
+    minLevel = 255;
+    for (let ry = 0; ry < h; ry++) {
+      for (let rx = 0; rx < w; rx++) {
+        const level = levelAt(rx, ry);
+        if (level < minLevel) minLevel = level;
+      }
+    }
+
+    // Ground tops. Merging a row's equal-level, equal-land-type cells into one
+    // quad keeps a plateau-heavy — or flat — map close to free; only the
+    // terraces' own corners and every ramp cost vertices.
+    for (let ry = 0; ry < h; ry++) {
+      for (let rx = 0; rx < w; rx++) {
+        if (!flatGround(rx, ry)) continue;
+        const level = levelAt(rx, ry);
+        const wet = isWater(rx, ry);
+        // A cell whose west neighbour shares its run is inside it already.
+        if (
+          rx > 0 && flatGround(rx - 1, ry) &&
+          levelAt(rx - 1, ry) === level && isWater(rx - 1, ry) === wet
+        ) continue;
+        let end = rx + 1;
+        while (
+          end < w && flatGround(end, ry) &&
+          levelAt(end, ry) === level && isWater(end, ry) === wet
+        ) end++;
+        const y = level * LEVEL_STEP;
+        quad(
+          wet ? water : floor,
+          rx, y, ry,
+          rx, y, ry + 1,
+          end, y, ry + 1,
+          end, y, ry,
+          rx / w, 1 - (ry + 1) / h, end / w, 1 - ry / h,
+        );
+      }
+    }
+
+    // Ramps: one tilted quad per cell, each corner dropping by the larger of
+    // its two edges' drops. A full-edge ramp then tilts on a single axis and a
+    // corner ramp on both, without overshooting either neighbour.
+    for (let ry = 0; ry < h; ry++) {
+      for (let rx = 0; rx < w; rx++) {
+        if (!isRamp(rx, ry) || isDeck(rx, ry)) continue;
+        const level = levelAt(rx, ry);
+        const west = rx > 0 ? levelAt(rx - 1, ry) : level;
+        const east = rx + 1 < w ? levelAt(rx + 1, ry) : level;
+        const north = ry > 0 ? levelAt(rx, ry - 1) : level;
+        const south = ry + 1 < h ? levelAt(rx, ry + 1) : level;
+        const dropWest = Math.max(0, level - west);
+        const dropEast = Math.max(0, level - east);
+        const dropNorth = Math.max(0, level - north);
+        const dropSouth = Math.max(0, level - south);
+        // Corner (0, 0) is the cell's min-x/min-z corner; cx picks the x-side
+        // (0 = west, 1 = east), cz the z-side (0 = north, 1 = south).
+        const corner = (cx: number, cz: number): number =>
+          (level - Math.max(cx === 0 ? dropWest : dropEast, cz === 0 ? dropNorth : dropSouth)) *
+          LEVEL_STEP;
+        quad(
+          isWater(rx, ry) ? water : floor,
+          rx, corner(0, 0), ry,
+          rx, corner(0, 1), ry + 1,
+          rx + 1, corner(1, 1), ry + 1,
+          rx + 1, corner(1, 0), ry,
+          rx / w, 1 - (ry + 1) / h, (rx + 1) / w, 1 - ry / h,
+        );
+      }
+    }
+
+    // Step faces. Each boundary is reached once, from its west or north cell,
+    // and drawn from the higher level down to the lower one; the material is
+    // double-sided, so the wall is solid from whichever side the camera stands.
+    // A ramp on the higher side already slopes to its neighbour: no face.
+    for (let ry = 0; ry < h; ry++) {
+      for (let rx = 0; rx < w; rx++) {
+        const level = levelAt(rx, ry);
+        if (rx + 1 < w) {
+          const east = levelAt(rx + 1, ry);
+          const higherRamp = level > east ? isRamp(rx, ry) : isRamp(rx + 1, ry);
+          if (east !== level && !higherRamp) {
+            const low = Math.min(level, east) * LEVEL_STEP;
+            const high = Math.max(level, east) * LEVEL_STEP;
+            quad(rock, rx + 1, low, ry, rx + 1, low, ry + 1, rx + 1, high, ry + 1, rx + 1, high, ry, 0, 0, 0, 0);
+          }
+        }
+        if (ry + 1 < h) {
+          const south = levelAt(rx, ry + 1);
+          const higherRamp = level > south ? isRamp(rx, ry) : isRamp(rx, ry + 1);
+          if (south !== level && !higherRamp) {
+            const low = Math.min(level, south) * LEVEL_STEP;
+            const high = Math.max(level, south) * LEVEL_STEP;
+            quad(rock, rx, low, ry + 1, rx + 1, low, ry + 1, rx + 1, high, ry + 1, rx, high, ry + 1, 0, 0, 0, 0);
+          }
+        }
+      }
+    }
+
+    // Bridge decks: a lifted steel top over the cell's own ground, plus a side
+    // face wherever the neighbour's surface sits lower — the span's flanks and
+    // its abutments. Adjacent equal decks share a top, so no face is drawn
+    // between them and the deck reads as one continuous span.
+    for (let ry = 0; ry < h; ry++) {
+      for (let rx = 0; rx < w; rx++) {
+        if (!isDeck(rx, ry)) continue;
+        const top = (levelAt(rx, ry) + deckAt(rx, ry)) * LEVEL_STEP;
+        const neighbourTop = (nx: number, ny: number): number =>
+          isDeck(nx, ny)
+            ? (levelAt(nx, ny) + deckAt(nx, ny)) * LEVEL_STEP
+            : levelAt(nx, ny) * LEVEL_STEP;
+        quad(
+          deck,
+          rx, top, ry,
+          rx, top, ry + 1,
+          rx + 1, top, ry + 1,
+          rx + 1, top, ry,
+          rx / w, 1 - (ry + 1) / h, (rx + 1) / w, 1 - ry / h,
+        );
+        const sides: { nx: number; ny: number; ax: number; az: number; bx: number; bz: number }[] = [];
+        if (rx > 0) sides.push({ nx: rx - 1, ny: ry, ax: rx, az: ry, bx: rx, bz: ry + 1 });
+        if (rx + 1 < w) sides.push({ nx: rx + 1, ny: ry, ax: rx + 1, az: ry, bx: rx + 1, bz: ry + 1 });
+        if (ry > 0) sides.push({ nx: rx, ny: ry - 1, ax: rx, az: ry, bx: rx + 1, bz: ry });
+        if (ry + 1 < h) sides.push({ nx: rx, ny: ry + 1, ax: rx, az: ry + 1, bx: rx + 1, bz: ry + 1 });
+        for (const side of sides) {
+          const base = neighbourTop(side.nx, side.ny);
+          if (base >= top) continue;
+          quad(deck, side.ax, base, side.az, side.bx, base, side.bz, side.bx, top, side.bz, side.ax, top, side.az, 0, 0, 0, 0);
+        }
+      }
+    }
+
+    const geometry = new THREE.BufferGeometry();
+    const position = [...floor.pos, ...rock.pos, ...water.pos, ...deck.pos];
+    const uv = [...floor.uv, ...rock.uv, ...water.uv, ...deck.uv];
+    geometry.setAttribute("position", new THREE.Float32BufferAttribute(position, 3));
+    geometry.setAttribute("uv", new THREE.Float32BufferAttribute(uv, 2));
+    geometry.computeVertexNormals();
+    // The four grids are concatenated in material order, so each is a
+    // contiguous range — empty ones simply get no group.
+    let start = 0;
+    const groups: [number, number][] = [
+      [floor.pos.length / 3, 0],
+      [rock.pos.length / 3, 1],
+      [water.pos.length / 3, 2],
+      [deck.pos.length / 3, 3],
+    ];
+    for (const [count, material] of groups) {
+      if (count > 0) geometry.addGroup(start, count, material);
+      start += count;
+    }
+    return geometry;
+  }
+
   function buildGround(w: number, h: number): void {
     if (plate) {
       scene.remove(plate);
       plate.geometry.dispose();
-      plate.material.map?.dispose();
-      plate.material.dispose();
+    }
+    for (const material of plateMaterials) {
+      material.map?.dispose();
+      material.dispose();
     }
     const texture = makeGridTexture(w, h);
     texture.colorSpace = THREE.SRGBColorSpace;
@@ -309,37 +578,17 @@ export function createMap3D(
     // chain jumps to a level far coarser than a cell and the grid averages away.
     texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
 
-    // One vertex per grid corner: `w` and `h` segments give `(w+1)*(h+1)` corners.
-    // A 500x500 map is ~251k vertices, uploaded once per map load.
-    const geometry = new THREE.PlaneGeometry(w, h, w, h);
-    let covered = false;
-    if (terrain && terrain.width === w && terrain.height === h) {
-      const position = geometry.getAttribute("position") as THREE.BufferAttribute;
-      minLevel = 255;
-      for (let i = 0; i < position.count; i++) {
-        // Local plane coords -> world cell coords, matching the mesh transform
-        // (rotated -90° about X, translated to the map centre).
-        const worldX = position.getX(i) + w / 2;
-        const worldZ = h / 2 - position.getY(i);
-        const level = levelAt(worldX, worldZ);
-        position.setZ(i, level * LEVEL_STEP);
-        if (level < minLevel) minLevel = level;
-      }
-      position.needsUpdate = true;
-      geometry.computeVertexNormals();
-      covered = true;
-    }
-    if (!covered) {
-      minLevel = 0;
-    }
-
-    plate = new THREE.Mesh(
-      geometry,
-      // Lit so the displaced relief shades; flat facets keep the terraces crisp.
-      new THREE.MeshLambertMaterial({ map: texture, flatShading: true }),
-    );
-    plate.rotation.x = -Math.PI / 2;
-    plate.position.set(w / 2, 0, h / 2);
+    // Only the floor carries the grid: rock, water and the bridge deck are
+    // solid, shaded by the same sun.
+    const shaded = { flatShading: true, side: THREE.DoubleSide };
+    const floorMaterial = new THREE.MeshLambertMaterial({ map: texture, flatShading: true });
+    const rockMaterial = new THREE.MeshLambertMaterial({ color: CLIFF_TONE, ...shaded });
+    const waterMaterial = new THREE.MeshLambertMaterial({ color: WATER_TONE, ...shaded });
+    const deckMaterial = new THREE.MeshLambertMaterial({ color: DECK_TONE, ...shaded });
+    plateMaterials = [floorMaterial, rockMaterial, waterMaterial, deckMaterial];
+    // The geometry is already in world space — X and Z are the cell axes and Y
+    // is the level — so the plate needs no transform of its own.
+    plate = new THREE.Mesh(buildPlateGeometry(w, h), plateMaterials);
     scene.add(plate);
   }
 
@@ -504,7 +753,7 @@ export function createMap3D(
 
   /** Centre the camera on a map cell, keeping the current orientation and zoom. */
   function focusOn(gx: number, gz: number): void {
-    orbitTarget.set(gx, levelAt(gx, gz) * LEVEL_STEP, gz);
+    orbitTarget.set(gx, surfaceAt(gx, gz), gz);
     applyCamera();
   }
 
@@ -554,7 +803,7 @@ export function createMap3D(
       cursorHalo.visible = false;
       return;
     }
-    const ground = levelAt(cell[0], cell[1]) * LEVEL_STEP;
+    const ground = surfaceAt(cell[0], cell[1]);
     cursorMarker.visible = true;
     cursorHalo.visible = true;
     cursorMarker.position.set(cell[0] + 0.5, ground + 0.06, cell[1] + 0.5);
@@ -582,7 +831,7 @@ export function createMap3D(
       glow.material.color.copy(scratchColor);
       glow.visible = true;
       const [bx, bz] = house.base_center;
-      glow.position.set(bx, levelAt(bx, bz) * LEVEL_STEP + 0.03, bz);
+      glow.position.set(bx, surfaceAt(bx, bz) + 0.03, bz);
       glow.scale.set(size, size, 1);
     }
   }
@@ -605,7 +854,7 @@ export function createMap3D(
       for (let s = 0; s < count; s++) {
         const [cx, cy] = steps[s].cell;
         array[s * 3] = cx + 0.5;
-        array[s * 3 + 1] = levelAt(cx, cy) * LEVEL_STEP + 0.7;
+        array[s * 3 + 1] = surfaceAt(cx, cy) + 0.7;
         array[s * 3 + 2] = cy + 0.5;
         blocked = blocked || !steps[s].walkable;
       }
@@ -649,7 +898,7 @@ export function createMap3D(
   /** Place one chip above the world point its cell names; false when it is
    *  behind the camera or off the visible canvas. */
   function place(el: HTMLElement, gx: number, gy: number): boolean {
-    projected.set(gx, levelAt(gx, gy) * LEVEL_STEP, gy).project(camera);
+    projected.set(gx, surfaceAt(gx, gy), gy).project(camera);
     if (projected.z > 1) return false;
     const left = (projected.x * 0.5 + 0.5) * canvas.clientWidth;
     const top = (-projected.y * 0.5 + 0.5) * canvas.clientHeight;
@@ -880,10 +1129,15 @@ export function createMap3D(
       // The elevation grid arrives once per map; cache it and rebuild the
       // surface only when the grid or the map size changes.
       if (snapshot.terrain) {
+        const grid = snapshot.terrain;
+        const count = grid.width * grid.height;
         terrain = {
-          width: snapshot.terrain.width,
-          height: snapshot.terrain.height,
-          levels: decodeTerrain(snapshot.terrain),
+          width: grid.width,
+          height: grid.height,
+          levels: decodeHex(grid.levels, count),
+          land: decodeHex(grid.land_types, count),
+          slope: decodeHex(grid.slope_types, count),
+          deck: decodeHex(grid.deck_rises, count),
         };
       }
       if (w !== extent.w || h !== extent.h) {
@@ -920,10 +1174,10 @@ export function createMap3D(
         glow.geometry.dispose();
         glow.material.dispose();
       }
-      if (plate) {
-        plate.material.map?.dispose();
-        plate.material.dispose();
-        plate.geometry.dispose();
+      if (plate) plate.geometry.dispose();
+      for (const material of plateMaterials) {
+        material.map?.dispose();
+        material.dispose();
       }
       for (const category of CATEGORIES) {
         entities.get(category)!.geometry.dispose();

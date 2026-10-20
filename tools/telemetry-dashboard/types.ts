@@ -1,8 +1,8 @@
 /**
- * Schema mirror of `src/sim/telemetry.rs` (v27); keep both in step.
+ * Schema mirror of `src/sim/telemetry.rs` (v28); keep both in step.
  */
 
-export const SCHEMA_VERSION = 27;
+export const SCHEMA_VERSION = 28;
 
 export type EntityCategory = "Unit" | "Infantry" | "Aircraft" | "Structure";
 
@@ -104,14 +104,24 @@ export interface EntitySpot {
   owner_index: number;
 }
 
-/** The map's elevation grid, sent once per map (schema v27). Levels are the
- *  engine's per-cell elevation bytes, row-major. `levels` is lowercase hex,
- *  two characters per cell: the dashboard decodes it into a `width*height`
- *  byte array for the 3D terrain surface. */
+/** The map's elevation grid, sent once per map (schema v28). Every grid is the
+ *  engine's own per-cell byte, row-major, lowercase hex with two characters per
+ *  cell; the dashboard decodes each into a `width*height` byte array.
+ *
+ *  - `levels`: ground elevation, the height the terraces stack on.
+ *  - `land_types`: `CellClass+0xEC` land type (`2` = Water), so water paints
+ *    apart from land.
+ *  - `slope_types`: TMP slope type, `0` flat, `1..=16` a ramp tile whose
+ *    surface tilts toward its lower neighbour.
+ *  - `deck_rises`: extra levels a structural bridge deck sits above the cell's
+ *    ground (`0` = none, which includes low ground-level bridges). */
 export interface TerrainGrid {
   width: number;
   height: number;
   levels: string;
+  land_types: string;
+  slope_types: string;
+  deck_rises: string;
 }
 
 export interface TimingSample {
@@ -351,7 +361,7 @@ export interface TelemetrySnapshot {
   binary_frame: number;
   map_width: number;
   map_height: number;
-  /** Elevation grid, sent once per map (schema v27); null on other snapshots. */
+  /** Elevation grid, sent once per map (schema v28); null on other snapshots. */
   terrain: TerrainGrid | null;
   entities_total: number;
   houses: HousePopulation[];

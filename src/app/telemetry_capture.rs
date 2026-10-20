@@ -286,30 +286,59 @@ pub fn publish_if_due(state: &mut AppState) {
 }
 
 /// Encode the app's elevation grid for the dashboard, or `None` when no map is
-/// loaded. Row-major levels, two lowercase hex digits per cell. The grid is
-/// static for a loaded map, so the caller caches the result; it is rebuilt only
-/// after a world replacement.
+/// loaded. Row-major, two lowercase hex digits per cell, for each of the four
+/// per-cell grids `TerrainGrid` carries: ground levels, land types, ramp slope
+/// types and bridge deck rises. All four come off the one `ResolvedTerrainCell`
+/// the map resolved, so the dashboard's water, ramps and bridges track the
+/// engine's own terrain rather than a re-derivation. The grid is static for a
+/// loaded map, so the caller caches the result; it is rebuilt only after a
+/// world replacement.
 fn build_terrain_grid(state: &AppState) -> Option<crate::sim::telemetry::TerrainGrid> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let runtime = state.match_state.sim_runtime.as_ref()?;
-    let width = runtime.simulation.session.map_width();
-    let height = runtime.simulation.session.map_height();
+    let sim = &runtime.simulation;
+    let width = sim.session.map_width();
+    let height = sim.session.map_height();
     if width == 0 || height == 0 {
         return None;
     }
+    let cells = sim.resolved_terrain.as_ref();
     let height_map = state.height_map();
-    let mut levels = String::with_capacity(usize::from(width) * usize::from(height) * 2);
+    let stride = usize::from(width) * usize::from(height);
+    let mut levels = String::with_capacity(stride * 2);
+    let mut land_types = String::with_capacity(stride * 2);
+    let mut slope_types = String::with_capacity(stride * 2);
+    let mut deck_rises = String::with_capacity(stride * 2);
+    let hex = |out: &mut String, value: u8| {
+        out.push(HEX[usize::from(value >> 4)] as char);
+        out.push(HEX[usize::from(value & 0x0f)] as char);
+    };
     for ry in 0..height {
         for rx in 0..width {
-            let level = height_map.get(&(rx, ry)).copied().unwrap_or(0);
-            levels.push(HEX[usize::from(level >> 4)] as char);
-            levels.push(HEX[usize::from(level & 0x0f)] as char);
+            let cell = cells.and_then(|grid| grid.cell(rx, ry));
+            // Without a resolved cell (no terrain yet) the elevation map still
+            // gives the level; land, slope and deck stay flat.
+            let level = cell
+                .map(|cell| cell.level)
+                .unwrap_or_else(|| height_map.get(&(rx, ry)).copied().unwrap_or(0));
+            // A structural deck sits `bridge_deck_level` above the cell's own
+            // ground level; a low, ground-level bridge reports no rise.
+            let deck_rise = cell
+                .and_then(|cell| cell.bridge_deck_level_if_any())
+                .map_or(0, |deck| deck.saturating_sub(level));
+            hex(&mut levels, level);
+            hex(&mut land_types, cell.map_or(0, |cell| cell.land_type()));
+            hex(&mut slope_types, cell.map_or(0, |cell| cell.slope_type));
+            hex(&mut deck_rises, deck_rise);
         }
     }
     Some(crate::sim::telemetry::TerrainGrid {
         width,
         height,
         levels,
+        land_types,
+        slope_types,
+        deck_rises,
     })
 }
 
