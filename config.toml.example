@@ -1,0 +1,18 @@
+# VERA20k configuration — copy to config.toml and adjust paths.
+# config.toml is gitignored because it contains machine-specific paths.
+
+[paths]
+# Point this to your Red Alert 2: Yuri's Revenge installation directory.
+# The engine reads .mix files directly from here (ra2.mix, language.mix, etc.)
+ra2_dir = "C:/Westwood/RA2"
+# Optional writable RA2MD.INI / KeyboardMD.INI location (defaults to ra2_dir).
+# Relative paths are resolved beside this config file. Assets stay in ra2_dir.
+# settings_dir = "."
+
+[graphics]
+extra_animations = true   # cosmetic effects: water/ore sparkles (future: laser pulses, particle trails)
+# Full screen, zoom and the original 4:3 shape are on the Options page (saved in RA2MD.INI).
+
+[gameplay]
+input_delay_ticks = 15
+pause_on_focus_loss = false   # true freezes a running match (sim and audio) while the window is in the background, like the original game
